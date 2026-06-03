@@ -2774,6 +2774,7 @@ impl GitPanel {
                         content: vec![content.into()],
                         cache: false,
                         reasoning_details: None,
+                        compaction_items: None,
                     }],
                     tools: Vec::new(),
                     tool_choice: None,

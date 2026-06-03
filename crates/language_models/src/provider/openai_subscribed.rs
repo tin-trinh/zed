@@ -480,15 +480,20 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         // `instructions` field rather than as input items.
         let mut instructions = Vec::new();
         responses_request.input.retain(|item| {
-            if let open_ai::responses::ResponseInputItem::Message(msg) = item {
-                if msg.role == open_ai::Role::System {
-                    for part in &msg.content {
-                        if let open_ai::responses::ResponseInputContent::Text { text } = part {
-                            instructions.push(text.clone());
+            if item.get("type").and_then(serde_json::Value::as_str) == Some("message")
+                && item.get("role").and_then(serde_json::Value::as_str) == Some("system")
+            {
+                if let Some(content) = item.get("content").and_then(serde_json::Value::as_array) {
+                    for part in content {
+                        if part.get("type").and_then(serde_json::Value::as_str)
+                            == Some("input_text")
+                            && let Some(text) = part.get("text").and_then(serde_json::Value::as_str)
+                        {
+                            instructions.push(text.to_string());
                         }
                     }
-                    return false;
                 }
+                return false;
             }
             true
         });

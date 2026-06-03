@@ -33,6 +33,11 @@ pub struct LanguageModelTextStream {
     pub last_token_usage: Arc<Mutex<TokenUsage>>,
 }
 
+pub enum LanguageModelCompactionEvent {
+    SummaryDelta(String),
+    Output(Vec<serde_json::Value>),
+}
+
 impl Default for LanguageModelTextStream {
     fn default() -> Self {
         Self {
@@ -132,6 +137,25 @@ pub trait LanguageModel: Send + Sync {
             LanguageModelCompletionError,
         >,
     >;
+
+    fn stream_compaction(
+        &self,
+        _request: LanguageModelRequest,
+        _cx: &AsyncApp,
+    ) -> Option<
+        BoxFuture<
+            'static,
+            Result<
+                BoxStream<
+                    'static,
+                    Result<LanguageModelCompactionEvent, LanguageModelCompletionError>,
+                >,
+                LanguageModelCompletionError,
+            >,
+        >,
+    > {
+        None
+    }
 
     fn stream_completion_text(
         &self,

@@ -919,6 +919,7 @@ mod tests {
                         reasoning: None,
                         tool_calls: None,
                         reasoning_details: Some(serde_json::json!([
+                        compaction_items: None,
                             {
                                 "type": "reasoning.text",
                                 "text": "Let me analyze this request...",
@@ -944,6 +945,7 @@ mod tests {
                         reasoning: None,
                         tool_calls: None,
                         reasoning_details: Some(serde_json::json!([
+                        compaction_items: None,
                             {
                                 "type": "reasoning.encrypted",
                                 "data": "EtgDCtUDAdHtim9OF5jm4aeZSBAtl/randomized123",
@@ -978,6 +980,7 @@ mod tests {
                             }),
                         }]),
                         reasoning_details: None,
+                        compaction_items: None,
                     },
                     finish_reason: None,
                 }],
@@ -997,6 +1000,7 @@ mod tests {
                         reasoning: None,
                         tool_calls: None,
                         reasoning_details: Some(serde_json::json!([])),
+                        compaction_items: None,
                     },
                     finish_reason: Some("tool_calls".into()),
                 }],

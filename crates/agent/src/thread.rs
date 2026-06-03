@@ -40,12 +40,12 @@ use gpui::{
 };
 use heck::ToSnakeCase as _;
 use language_model::{
-    CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry,
-    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
-    LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
-    LanguageModelToolUse, LanguageModelToolUseId, MessageContent, Role, SelectedModel, Speed,
-    StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
+    CompletionIntent, LanguageModel, LanguageModelCompactionEvent, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelId, LanguageModelImage, LanguageModelProviderId,
+    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
+    LanguageModelRequestTool, LanguageModelToolResult, LanguageModelToolResultContent,
+    LanguageModelToolSchemaFormat, LanguageModelToolUse, LanguageModelToolUseId, MessageContent,
+    Role, SelectedModel, Speed, StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
 };
 use project::Project;
 use prompt_store::ProjectContext;
@@ -151,29 +151,37 @@ pub enum Message {
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub enum CompactionInfo {
-    Summary(SharedString),
-    ProviderNative {
-        provider: LanguageModelProviderId,
-        items: Vec<serde_json::Value>,
-    },
+pub struct CompactionInfo {
+    pub summary: SharedString,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<serde_json::Value>>,
 }
 
 impl CompactionInfo {
     fn to_request(&self) -> Vec<LanguageModelRequestMessage> {
-        match self {
-            Self::Summary(summary) => vec![LanguageModelRequestMessage {
-                role: Role::User,
-                content: vec![format!(
-                    "The previous conversation was compacted. Use this summary as context:\n\n{}",
-                    summary
-                )
-                .into()],
-                cache: false,
-                reasoning_details: None,
-            }],
-            Self::ProviderNative { .. } => Vec::new(),
+        if self.summary.is_empty() && self.items.is_none() {
+            return Vec::new();
         }
+
+        let content = if self.items.is_some() {
+            Vec::new()
+        } else {
+            vec![
+                format!(
+                    "The previous conversation was compacted. Use this summary as context:\n\n{}",
+                    self.summary
+                )
+                .into(),
+            ]
+        };
+
+        vec![LanguageModelRequestMessage {
+            role: Role::User,
+            content,
+            cache: false,
+            reasoning_details: None,
+            compaction_items: self.items.as_ref().map(|items| Arc::new(items.clone())),
+        }]
     }
 }
 
@@ -201,6 +209,7 @@ impl Message {
                 content: vec!["Continue where you left off".into()],
                 cache: false,
                 reasoning_details: None,
+                compaction_items: None,
             }],
         }
     }
@@ -270,6 +279,7 @@ impl UserMessage {
             content: Vec::with_capacity(self.content.len()),
             cache: false,
             reasoning_details: None,
+            compaction_items: None,
         };
 
         const OPEN_CONTEXT: &str = "<context>\n\
@@ -605,6 +615,7 @@ impl AgentMessage {
             content: Vec::with_capacity(self.content.len()),
             cache: false,
             reasoning_details: self.reasoning_details.clone(),
+            compaction_items: None,
         };
         for chunk in &self.content {
             match chunk {
@@ -641,6 +652,7 @@ impl AgentMessage {
             content: Vec::new(),
             cache: false,
             reasoning_details: None,
+            compaction_items: None,
         };
 
         for tool_result in self.tool_results.values() {
@@ -1377,14 +1389,9 @@ impl Thread {
                     let compaction_id = acp_thread::ContextCompactionId(
                         format!("replay-compaction-{message_ix}").into(),
                     );
-                    match info {
-                        CompactionInfo::Summary(summary) => {
-                            stream.send_context_compaction(compaction_id.clone());
-                            stream.send_context_compaction_update(compaction_id.clone(), summary);
-                        }
-                        CompactionInfo::ProviderNative { .. } => {
-                            stream.send_context_compaction(compaction_id);
-                        }
+                    stream.send_context_compaction(compaction_id.clone());
+                    if !info.summary.is_empty() {
+                        stream.send_context_compaction_update(compaction_id, &info.summary);
                     }
                 }
             }
@@ -2526,14 +2533,16 @@ impl Thread {
         mut cancellation_rx: watch::Receiver<bool>,
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
-        let Some((model, request, insertion_ix)) = this.update(cx, |this, cx| {
-            let Some(insertion_ix) = this.compaction_message_target_ix() else {
-                return None;
-            };
-            let model = this.model.clone()?;
-            let request = this.build_compaction_request(insertion_ix, &model, cx);
-            Some((model, request, insertion_ix))
-        })?
+        let Some((model, native_request, summary_request, insertion_ix)) =
+            this.update(cx, |this, cx| {
+                let Some(insertion_ix) = this.compaction_message_target_ix() else {
+                    return None;
+                };
+                let model = this.model.clone()?;
+                let native_request = this.build_native_compaction_request(insertion_ix, &model, cx);
+                let summary_request = this.build_compaction_request(insertion_ix, &model, cx);
+                Some((model, native_request, summary_request, insertion_ix))
+            })?
         else {
             return Ok(ControlFlow::Continue(()));
         };
@@ -2541,8 +2550,74 @@ impl Thread {
         log::debug!("Running compaction");
         let compaction_id = acp_thread::ContextCompactionId(Uuid::new_v4().to_string().into());
         event_stream.send_context_compaction(compaction_id.clone());
+
+        if let Some(stream_compaction) = model.stream_compaction(native_request, cx) {
+            let stream = futures::select! {
+                result = stream_compaction.fuse() => result?,
+                _ = cancellation_rx.changed().fuse() => {
+                    if *cancellation_rx.borrow() {
+                        log::debug!("Compaction cancelled before native stream started");
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    return Ok(ControlFlow::Continue(()));
+                }
+            };
+            let mut stream = stream.fuse();
+            let mut summary = String::new();
+            let mut items = None;
+
+            loop {
+                let event = futures::select! {
+                    event = stream.next().fuse() => event,
+                    _ = cancellation_rx.changed().fuse() => {
+                        if *cancellation_rx.borrow() {
+                            log::debug!("Compaction cancelled while streaming native output");
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        continue;
+                    }
+                };
+
+                let Some(event) = event else {
+                    break;
+                };
+
+                match event? {
+                    LanguageModelCompactionEvent::SummaryDelta(delta) => {
+                        summary.push_str(&delta);
+                        event_stream.send_context_compaction_update(compaction_id.clone(), &delta);
+                    }
+                    LanguageModelCompactionEvent::Output(output) => {
+                        items = Some(output);
+                    }
+                }
+            }
+
+            if let Some(items) = items {
+                if *cancellation_rx.borrow() {
+                    log::debug!("Compaction cancelled after native stream completed");
+                    return Ok(ControlFlow::Break(()));
+                }
+
+                this.update(cx, |this, cx| {
+                    let compaction = Arc::new(Message::Compaction(CompactionInfo {
+                        summary: summary.trim().to_string().into(),
+                        items: Some(items),
+                    }));
+                    if insertion_ix <= this.messages.len() {
+                        this.messages.insert(insertion_ix, compaction);
+                    } else {
+                        this.messages.push(compaction);
+                    }
+                    cx.notify();
+                })?;
+
+                return Ok(ControlFlow::Continue(()));
+            }
+        }
+
         let stream = futures::select! {
-            result = model.stream_completion(request, cx).fuse() => result,
+            result = model.stream_completion(summary_request, cx).fuse() => result,
             _ = cancellation_rx.changed().fuse() => {
                 if *cancellation_rx.borrow() {
                     log::debug!("Compaction cancelled before request started");
@@ -2602,7 +2677,10 @@ impl Thread {
         log::debug!("Compaction succeeded:\n{summary}");
 
         this.update(cx, |this, cx| {
-            let compaction = Arc::new(Message::Compaction(CompactionInfo::Summary(summary.into())));
+            let compaction = Arc::new(Message::Compaction(CompactionInfo {
+                summary: summary.into(),
+                items: None,
+            }));
             if insertion_ix <= this.messages.len() {
                 this.messages.insert(insertion_ix, compaction);
             } else {
@@ -3135,6 +3213,7 @@ impl Thread {
             content: vec![SUMMARIZE_THREAD_DETAILED_PROMPT.into()],
             cache: false,
             reasoning_details: None,
+            compaction_items: None,
         });
 
         let task = cx
@@ -3198,6 +3277,7 @@ impl Thread {
             content: vec![SUMMARIZE_THREAD_PROMPT.into()],
             cache: false,
             reasoning_details: None,
+            compaction_items: None,
         });
         self.pending_title_generation = Some(cx.spawn(async move |this, cx| {
             let mut title = String::new();
@@ -3579,6 +3659,7 @@ impl Thread {
             content: vec![system_prompt.into()],
             cache: false,
             reasoning_details: None,
+            compaction_items: None,
         }];
         self.extend_request_history_until(&mut messages, end_ix);
 
@@ -3603,7 +3684,7 @@ impl Thread {
 
         if matches!(
             &*self.messages[compaction_ix],
-            Message::Compaction(CompactionInfo::Summary(_))
+            Message::Compaction(CompactionInfo { items: None, .. })
         ) {
             messages.extend(self.retained_user_request_messages_before(compaction_ix));
         }
@@ -3676,6 +3757,22 @@ impl Thread {
         Some(insertion_ix)
     }
 
+    fn build_native_compaction_request(
+        &self,
+        insertion_ix: usize,
+        model: &Arc<dyn LanguageModel>,
+        cx: &App,
+    ) -> LanguageModelRequest {
+        LanguageModelRequest {
+            thread_id: Some(self.id.to_string()),
+            prompt_id: Some(self.prompt_id.to_string()),
+            intent: Some(CompletionIntent::ThreadContextSummarization),
+            temperature: AgentSettings::temperature_for_model(model, cx),
+            messages: self.build_request_messages_until(Vec::new(), insertion_ix, cx),
+            ..Default::default()
+        }
+    }
+
     fn build_compaction_request(
         &self,
         insertion_ix: usize,
@@ -3696,6 +3793,7 @@ impl Thread {
             content: vec![COMPACTION_PROMPT.into()],
             cache: false,
             reasoning_details: None,
+            compaction_items: None,
         });
 
         request
@@ -5386,7 +5484,10 @@ mod tests {
 
     #[test]
     fn test_summary_compaction_renders_for_request_and_markdown() {
-        let message = Message::Compaction(CompactionInfo::Summary("Older context".into()));
+        let message = Message::Compaction(CompactionInfo {
+            summary: "Older context".into(),
+            items: None,
+        });
 
         assert_eq!(message.role(), Role::User);
         assert_eq!(message.to_markdown(), "--- Context Compacted ---\n");
@@ -5421,7 +5522,10 @@ mod tests {
     }
 
     fn summary_compaction(summary: &str) -> Arc<Message> {
-        Arc::new(Message::Compaction(CompactionInfo::Summary(summary.into())))
+        Arc::new(Message::Compaction(CompactionInfo {
+            summary: summary.into(),
+            items: None,
+        }))
     }
 
     fn summary_request_text(summary: &str) -> String {
@@ -5562,7 +5666,7 @@ mod tests {
                 assert!(matches!(&*thread.messages[1], Message::Agent(_)));
                 assert!(matches!(
                     &*thread.messages[2],
-                    Message::Compaction(CompactionInfo::Summary(summary)) if summary.as_ref() == "compacted old context"
+                    Message::Compaction(CompactionInfo { summary, items: None }) if summary.as_ref() == "compacted old context"
                 ));
                 assert!(matches!(&*thread.messages[3], Message::User(_)));
             });
@@ -5621,18 +5725,20 @@ mod tests {
     #[gpui::test]
     async fn test_native_compaction_boundary(cx: &mut TestAppContext) {
         let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model: Arc<dyn LanguageModel> = Arc::new(FakeLanguageModel::default());
 
         let request_messages = cx.update(|cx| {
             thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
                 thread
                     .messages
                     .push(user_text_message(UserMessageId::new(), "before native"));
-                thread.messages.push(Arc::new(Message::Compaction(
-                    CompactionInfo::ProviderNative {
-                        provider: LanguageModelProviderId::from("openai".to_string()),
-                        items: vec![json!({"type": "compaction"})],
-                    },
-                )));
+                thread
+                    .messages
+                    .push(Arc::new(Message::Compaction(CompactionInfo {
+                        summary: "".into(),
+                        items: Some(vec![json!({"type": "compaction"})]),
+                    })));
                 thread
                     .messages
                     .push(user_text_message(UserMessageId::new(), "after native"));
@@ -5643,7 +5749,11 @@ mod tests {
 
         assert_eq!(
             request_texts_after_system(&request_messages),
-            vec!["after native".to_string()]
+            vec!["".to_string(), "after native".to_string()]
+        );
+        assert_eq!(
+            request_messages[1].compaction_items.as_deref(),
+            Some(&vec![json!({"type": "compaction"})])
         );
     }
 
@@ -5706,6 +5816,8 @@ mod tests {
             content: vec![MessageContent::Text("hello 👋 world".to_string())],
             cache: false,
             reasoning_details: None,
+
+            compaction_items: None,
         };
 
         let truncated = truncate_user_message_to_byte_budget(message, 8).unwrap();
@@ -5728,6 +5840,8 @@ mod tests {
             ],
             cache: false,
             reasoning_details: None,
+
+            compaction_items: None,
         };
 
         let truncated = truncate_user_message_to_byte_budget(message, 8).unwrap();

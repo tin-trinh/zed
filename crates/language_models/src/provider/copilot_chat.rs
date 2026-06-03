@@ -1639,6 +1639,7 @@ mod tests {
                 ],
                 cache: false,
                 reasoning_details: Some(Arc::new(json!({
+                compaction_items: None,
                     "reasoning_items": [
                         {
                             "id": "r1",

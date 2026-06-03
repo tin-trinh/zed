@@ -6,15 +6,19 @@ use gpui::{AnyView, App, AsyncApp, Context, Entity, SharedString, Task, TaskExt,
 use http_client::{CustomHeaders, HttpClient};
 use language_model::{
     ApiKeyState, AuthenticateError, EnvVar, FastModeConfirmation, IconOrSvg, LanguageModel,
-    LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelEffortLevel,
-    LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
-    LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
-    LanguageModelToolChoice, OPEN_AI_PROVIDER_ID, OPEN_AI_PROVIDER_NAME, RateLimiter, env_var,
+    LanguageModelCompactionEvent, LanguageModelCompletionError, LanguageModelCompletionEvent,
+    LanguageModelEffortLevel, LanguageModelId, LanguageModelName, LanguageModelProvider,
+    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
+    LanguageModelRequest, LanguageModelToolChoice, OPEN_AI_PROVIDER_ID, OPEN_AI_PROVIDER_NAME,
+    RateLimiter, env_var,
 };
 use menu;
 use open_ai::{
     OPEN_AI_API_URL, ResponseStreamEvent,
-    responses::{Request as ResponseRequest, StreamEvent as ResponsesStreamEvent, stream_response},
+    responses::{
+        Request as ResponseRequest, StreamEvent as ResponsesStreamEvent, compact_response,
+        stream_response,
+    },
     stream_completion,
 };
 use settings::{OpenAiAvailableModel as AvailableModel, Settings, SettingsStore};
@@ -409,6 +413,41 @@ impl OpenAiLanguageModel {
 
         async move { Ok(future.await?.boxed()) }.boxed()
     }
+
+    fn compact_response(
+        &self,
+        request: ResponseRequest,
+        cx: &AsyncApp,
+    ) -> BoxFuture<'static, Result<Vec<serde_json::Value>, LanguageModelCompletionError>> {
+        let http_client = self.http_client.clone();
+
+        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, cx| {
+            let api_url = OpenAiLanguageModelProvider::api_url(cx);
+            let extra_headers = OpenAiLanguageModelProvider::settings(cx)
+                .custom_headers
+                .clone();
+            (state.api_key_state.key(&api_url), api_url, extra_headers)
+        });
+
+        let provider = PROVIDER_NAME;
+        let future = self.request_limiter.run(async move {
+            let Some(api_key) = api_key else {
+                return Err(LanguageModelCompletionError::NoApiKey { provider });
+            };
+            let response = compact_response(
+                http_client.as_ref(),
+                provider.0.as_str(),
+                &api_url,
+                &api_key,
+                request,
+                &extra_headers,
+            )
+            .await?;
+            Ok(response.output)
+        });
+
+        async move { future.await }.boxed()
+    }
 }
 
 impl LanguageModel for OpenAiLanguageModel {
@@ -548,6 +587,54 @@ impl LanguageModel for OpenAiLanguageModel {
             }
             .boxed()
         }
+    }
+
+    fn stream_compaction(
+        &self,
+        mut request: LanguageModelRequest,
+        cx: &AsyncApp,
+    ) -> Option<
+        BoxFuture<
+            'static,
+            Result<
+                futures::stream::BoxStream<
+                    'static,
+                    Result<LanguageModelCompactionEvent, LanguageModelCompletionError>,
+                >,
+                LanguageModelCompletionError,
+            >,
+        >,
+    > {
+        if !self.model.uses_responses_api() {
+            return None;
+        }
+
+        if !self.model.supports_priority() {
+            request.speed = None;
+        }
+
+        let request = into_open_ai_response(
+            request,
+            self.model.id(),
+            self.model.supports_parallel_tool_calls(),
+            self.model.supports_prompt_cache_key(),
+            self.max_output_tokens(),
+            default_thinking_reasoning_effort(&self.model),
+            self.model
+                .supported_reasoning_efforts()
+                .contains(&open_ai::ReasoningEffort::None),
+        );
+        let compacted = self.compact_response(request, cx);
+        Some(
+            async move {
+                let output = compacted.await?;
+                Ok(futures::stream::once(async move {
+                    Ok(LanguageModelCompactionEvent::Output(output))
+                })
+                .boxed())
+            }
+            .boxed(),
+        )
     }
 }
 

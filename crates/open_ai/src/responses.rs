@@ -14,7 +14,7 @@ pub struct Request {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub input: Vec<ResponseInputItem>,
+    pub input: Vec<Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<ResponseIncludable>,
     #[serde(default)]
@@ -149,6 +149,11 @@ pub enum ToolDefinition {
         #[serde(skip_serializing_if = "Option::is_none")]
         strict: Option<bool>,
     },
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct CompactedResponse {
+    pub output: Vec<Value>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -433,6 +438,55 @@ pub struct ResponseFunctionToolCall {
     pub name: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
+}
+
+pub async fn compact_response(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    mut request: Request,
+    extra_headers: &CustomHeaders,
+) -> Result<CompactedResponse, RequestError> {
+    let uri = format!("{api_url}/responses/compact");
+    request.stream = false;
+
+    let request = HttpRequest::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", api_key.trim()))
+        .extra_headers(extra_headers)
+        .body(AsyncBody::from(
+            serde_json::to_string(&request).map_err(|e| RequestError::Other(e.into()))?,
+        ))
+        .map_err(|e| RequestError::Other(e.into()))?;
+
+    let mut response = client.send(request).await?;
+    let mut body = String::new();
+    response
+        .body_mut()
+        .read_to_string(&mut body)
+        .await
+        .map_err(|e| RequestError::Other(e.into()))?;
+
+    if response.status().is_success() {
+        serde_json::from_str::<CompactedResponse>(&body).map_err(|error| {
+            log::error!(
+                "Failed to parse OpenAI compacted response: `{}`\nResponse: `{}`",
+                error,
+                body,
+            );
+            RequestError::Other(anyhow!(error))
+        })
+    } else {
+        Err(RequestError::HttpResponseError {
+            provider: provider_name.to_owned(),
+            status_code: response.status(),
+            body,
+            headers: response.headers().clone(),
+        })
+    }
 }
 
 pub async fn stream_response(
